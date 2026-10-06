@@ -8,8 +8,6 @@ NeuraSense classifies emotion from speech into seven classes (angry, disgust, fe
 Results not generated yet. Run `python train_model.py`, then `python fill_readme.py`.
 <!-- RESULTS END -->
 
-![Confusion matrix](models/confusion_matrix.png)
-
 ## Why the evaluation changed
 
 The first version of this project used a random split over all samples. That looked fine and reported high accuracy, but it had four leaks:
