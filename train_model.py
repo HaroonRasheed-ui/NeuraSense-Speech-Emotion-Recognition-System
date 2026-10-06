@@ -1,17 +1,26 @@
 """
-Speech Emotion Recognition - FINAL Training Script
-===================================================
-Key improvements:
-  1. FEATURE CACHING  - extracts once, saves to disk, reloads in seconds next run
-  2. FIXED ENSEMBLE   - SVM class alignment bug fixed (str conversion)
-  3. OVERFITTING FIX  - stronger dropout + L2 reg + lower augmentation ratio
-  4. LSTM model       - as required by the internship instructions (CNN + LSTM)
-  5. FAST             - cached run takes < 2 min total
+NeuraSense: Speech Emotion Recognition training script
+=======================================================
+
+Evaluation protocol (speaker independent):
+  1. Every sample is tagged with its speaker (RAVDESS actor, TESS speaker).
+  2. Duplicate files in the Kaggle copies are removed by file name.
+  3. Speakers are split into folds with StratifiedGroupKFold, so no speaker
+     ever appears in both training and test data.
+  4. Augmented (pitch shifted) copies are only used for training. Test and
+     validation sets contain original recordings only.
+  5. Early stopping uses a validation set of separate held out speakers,
+     never the test set.
+  6. The feature scaler is fit on training data only, in every fold.
+
+Optionally the old random split protocol is also run, so the gap between
+the two numbers can be reported.
 
 Run: python train_model.py
+Results: models/results.json, models/confusion_matrix.png
 """
 
-import os, sys, pickle, hashlib, warnings
+import os, sys, json, pickle, random, warnings
 import numpy as np
 warnings.filterwarnings('ignore')
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
@@ -23,9 +32,9 @@ if _ROOT not in sys.path:
 
 from tqdm import tqdm
 import librosa
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, accuracy_score
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 import matplotlib; matplotlib.use('Agg')
@@ -37,173 +46,186 @@ from utils.feature_extractor import extract_features  # type: ignore[import]
 import tensorflow as tf
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
-    Dense, Dropout, BatchNormalization,
-    Conv1D, MaxPooling1D, GlobalAveragePooling1D,
-    Input, LSTM, Bidirectional, Reshape
+    Dense, Dropout, BatchNormalization, Conv1D, MaxPooling1D, Input, LSTM
 )
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras import regularizers
 
-print("=" * 60)
-print("  SPEECH EMOTION RECOGNITION  —  FINAL TRAINING")
-print("=" * 60)
-
 # ── CONFIG ────────────────────────────────────────────────
-RAVDESS_PATH  = "./dataset/ravdess"
-TESS_PATH     = "./dataset/tess"
-MODEL_DIR     = "./models"
-CACHE_DIR     = "./cache"        # features saved here after first run
-SR            = 22050
-DURATION      = 3
-BATCH_SIZE    = 64
-EPOCHS        = 100
-AUGMENT       = True
+RAVDESS_PATH = "./dataset/ravdess"
+TESS_PATH    = "./dataset/tess"
+MODEL_DIR    = "./models"
+CACHE_DIR    = "./cache"
+SR           = 22050
+DURATION     = 3
+BATCH_SIZE   = 64
+EPOCHS       = 100
+AUGMENT      = True
+SEED         = 42
+
+N_FOLDS               = 5      # speaker grouped folds
+RUN_ALL_FOLDS         = True   # False = only fold 1 (faster)
+VAL_SPEAKER_FRACTION  = 0.15   # share of training speakers held out for early stopping
+COMPARE_RANDOM_SPLIT  = True   # also run the old random split protocol
+VERBOSE               = 0      # Keras training output (0, 1 or 2)
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 RAVDESS_MAP = {
-    '01': 'neutral', '02': 'neutral',  '03': 'happy',
-    '04': 'sad',     '05': 'angry',    '06': 'fearful',
+    '01': 'neutral', '02': 'neutral', '03': 'happy',
+    '04': 'sad',     '05': 'angry',   '06': 'fearful',
     '07': 'disgust', '08': 'surprised'
 }
 TESS_MAP = {
-    'angry':'angry','disgust':'disgust','fear':'fearful',
-    'happy':'happy','neutral':'neutral','ps':'surprised','sad':'sad'
+    'angry': 'angry', 'disgust': 'disgust', 'fear': 'fearful',
+    'happy': 'happy', 'neutral': 'neutral', 'ps': 'surprised', 'sad': 'sad'
 }
 
 
+def set_seeds(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+
+
 # ══════════════════════════════════════════════════════════
-# STEP 1 — DATA LOADING WITH CACHING
+# STEP 1: DATA LOADING (speaker tagged, deduplicated, cached)
 # ══════════════════════════════════════════════════════════
 def _cache_path(name):
-    return os.path.join(CACHE_DIR, f"{name}_features.pkl")
+    # v2 cache stores speaker and augmentation info; old caches are ignored
+    return os.path.join(CACHE_DIR, f"{name}_v2_records.pkl")
+
+
+def _wav_files_dedup(path):
+    """Walk a folder and keep one copy of each file name."""
+    seen, files, dupes = set(), [], 0
+    for r, _, fs in os.walk(path):
+        for f in sorted(fs):
+            if not f.lower().endswith('.wav'):
+                continue
+            if f in seen:
+                dupes += 1
+                continue
+            seen.add(f)
+            files.append(os.path.join(r, f))
+    return files, dupes
 
 
 def load_ravdess(path):
     cache = _cache_path("ravdess")
     if os.path.exists(cache):
-        print("  ✅ RAVDESS cache found — loading instantly...")
+        print("  RAVDESS cache found, loading...")
         with open(cache, 'rb') as f:
             return pickle.load(f)
 
-    X, y = [], []
     if not os.path.exists(path):
-        print(f"  ⚠  RAVDESS not found at {path}"); return X, y
+        print(f"  RAVDESS not found at {path}")
+        return []
 
-    files = [
-        os.path.join(r, f)
-        for r, _, fs in os.walk(path) for f in fs if f.endswith('.wav')
-    ]
-    print(f"\n  RAVDESS: {len(files)} files  (first-time extraction, will cache)")
+    files, dupes = _wav_files_dedup(path)
+    print(f"\n  RAVDESS: {len(files)} unique files ({dupes} duplicates skipped)")
 
+    records = []
     for fp in tqdm(files, desc="  RAVDESS", ncols=80):
-        parts = os.path.basename(fp).split('-')
-        if len(parts) < 3: continue
+        parts = os.path.basename(fp).replace('.wav', '').split('-')
+        if len(parts) < 7:
+            continue
         emotion = RAVDESS_MAP.get(parts[2])
-        if not emotion: continue
+        if not emotion:
+            continue
+        speaker = f"ravdess_actor_{parts[6]}"
 
         feats = extract_features(file_path=fp, sr=SR, duration=DURATION)
-        if feats is None: continue
-        X.append(feats); y.append(emotion)
+        if feats is None:
+            continue
+        records.append(dict(x=feats, y=emotion, speaker=speaker, aug=False))
 
         if AUGMENT:
             try:
                 audio, _ = librosa.load(fp, sr=SR, duration=DURATION, offset=0.5)
                 for steps in [2, -2]:
                     aug = librosa.effects.pitch_shift(audio, sr=SR, n_steps=steps)
-                    f2  = extract_features(audio=aug, sr=SR, duration=DURATION)
+                    f2 = extract_features(audio=aug, sr=SR, duration=DURATION)
                     if f2 is not None:
-                        X.append(f2); y.append(emotion)
+                        records.append(dict(x=f2, y=emotion, speaker=speaker, aug=True))
             except Exception:
                 pass
 
     with open(cache, 'wb') as f:
-        pickle.dump((X, y), f)
-    print(f"  ✅ RAVDESS: {len(X)} samples cached → {cache}")
-    return X, y
+        pickle.dump(records, f)
+    print(f"  RAVDESS: {len(records)} samples cached")
+    return records
+
+
+def _tess_speaker(fp):
+    prefix = os.path.basename(fp).split('_')[0].upper()
+    if prefix in ('OAF', 'YAF'):
+        return f"tess_{prefix}"
+    folder = os.path.basename(os.path.dirname(fp)).split('_')[0].upper()
+    return f"tess_{folder}" if folder in ('OAF', 'YAF') else None
 
 
 def load_tess(path):
     cache = _cache_path("tess")
     if os.path.exists(cache):
-        print("  ✅ TESS cache found — loading instantly...")
+        print("  TESS cache found, loading...")
         with open(cache, 'rb') as f:
             return pickle.load(f)
 
-    X, y = [], []
     if not os.path.exists(path):
-        print(f"  ⚠  TESS not found at {path}"); return X, y
+        print(f"  TESS not found at {path}")
+        return []
 
-    files = [
-        (os.path.join(r, f), f)
-        for r, _, fs in os.walk(path) for f in fs if f.endswith('.wav')
-    ]
-    print(f"\n  TESS: {len(files)} files  (first-time extraction, will cache)")
+    files, dupes = _wav_files_dedup(path)
+    print(f"\n  TESS: {len(files)} unique files ({dupes} duplicates skipped)")
 
-    for fp, fname in tqdm(files, desc="  TESS", ncols=80):
-        parts  = fname.lower().replace('.wav','').split('_')
+    records = []
+    for fp in tqdm(files, desc="  TESS", ncols=80):
+        parts = os.path.basename(fp).lower().replace('.wav', '').split('_')
         emotion = next((TESS_MAP[p] for p in parts if p in TESS_MAP), None)
-        if not emotion: continue
+        speaker = _tess_speaker(fp)
+        if not emotion or not speaker:
+            continue
         feats = extract_features(file_path=fp, sr=SR, duration=DURATION)
-        if feats is None: continue
-        X.append(feats); y.append(emotion)
+        if feats is None:
+            continue
+        records.append(dict(x=feats, y=emotion, speaker=speaker, aug=False))
 
     with open(cache, 'wb') as f:
-        pickle.dump((X, y), f)
-    print(f"  ✅ TESS: {len(X)} samples cached → {cache}")
-    return X, y
+        pickle.dump(records, f)
+    print(f"  TESS: {len(records)} samples cached")
+    return records
 
 
 # ══════════════════════════════════════════════════════════
-# STEP 2 — MODEL: CNN + LSTM (as per internship requirement)
-#   Anti-overfitting measures:
-#     - L2 regularisation on all Conv/Dense
-#     - Spatial dropout after CNN blocks
-#     - Dropout 0.4-0.5 in classifier
-#     - BatchNorm throughout
-#     - EarlyStopping on val_accuracy
+# STEP 2: MODEL (CNN + stacked LSTM)
 # ══════════════════════════════════════════════════════════
 def build_cnn_lstm(input_dim, num_classes):
-    """
-    CNN + LSTM hybrid — required by internship spec.
-    CNN extracts local patterns, LSTM captures temporal sequence.
-    L2 regularisation + dropout prevents overfitting.
-    """
     reg = regularizers.l2(1e-4)
     inp = Input(shape=(input_dim, 1))
 
-    # ── CNN Block 1 ──
-    x = Conv1D(64, 5, padding='same', activation='relu',
-               kernel_regularizer=reg)(inp)
+    x = Conv1D(64, 5, padding='same', activation='relu', kernel_regularizer=reg)(inp)
     x = BatchNormalization()(x)
-    x = Conv1D(64, 5, padding='same', activation='relu',
-               kernel_regularizer=reg)(x)
+    x = Conv1D(64, 5, padding='same', activation='relu', kernel_regularizer=reg)(x)
     x = BatchNormalization()(x)
     x = MaxPooling1D(4)(x)
     x = Dropout(0.3)(x)
 
-    # ── CNN Block 2 ──
-    x = Conv1D(128, 3, padding='same', activation='relu',
-               kernel_regularizer=reg)(x)
+    x = Conv1D(128, 3, padding='same', activation='relu', kernel_regularizer=reg)(x)
     x = BatchNormalization()(x)
-    x = Conv1D(128, 3, padding='same', activation='relu',
-               kernel_regularizer=reg)(x)
+    x = Conv1D(128, 3, padding='same', activation='relu', kernel_regularizer=reg)(x)
     x = BatchNormalization()(x)
     x = MaxPooling1D(4)(x)
     x = Dropout(0.3)(x)
 
-    # ── LSTM Block ── (temporal modelling)
-    x = LSTM(128, return_sequences=True,
-             dropout=0.3, recurrent_dropout=0.2,
+    x = LSTM(128, return_sequences=True, dropout=0.3, recurrent_dropout=0.2,
              kernel_regularizer=reg)(x)
-    x = LSTM(64, return_sequences=False,
-             dropout=0.3, recurrent_dropout=0.2,
+    x = LSTM(64, return_sequences=False, dropout=0.3, recurrent_dropout=0.2,
              kernel_regularizer=reg)(x)
 
-    # ── Classifier ──
     x = Dense(128, activation='relu', kernel_regularizer=reg)(x)
     x = BatchNormalization()(x)
     x = Dropout(0.4)(x)
@@ -212,206 +234,232 @@ def build_cnn_lstm(input_dim, num_classes):
     out = Dense(num_classes, activation='softmax')(x)
 
     model = Model(inp, out)
-    model.compile(
-        optimizer=Adam(learning_rate=0.001, clipnorm=1.0),
-        loss='categorical_crossentropy',
-        metrics=['accuracy']
-    )
+    model.compile(optimizer=Adam(learning_rate=0.001, clipnorm=1.0),
+                  loss='categorical_crossentropy', metrics=['accuracy'])
     return model
 
 
 # ══════════════════════════════════════════════════════════
-# STEP 3 — ENSEMBLE  (bug-fixed: str() cast on classes)
+# STEP 3: ENSEMBLE
+# Class columns are aligned by integer label. (The previous version
+# compared string class names with integer labels, so SVM and RF
+# probabilities were always zero and the "ensemble" was the CNN alone.)
 # ══════════════════════════════════════════════════════════
-def train_ensemble(X_tr, y_tr, X_val, y_val, le):
-    print("\n  Training SVM (RBF kernel)...")
-    svm = SVC(kernel='rbf', C=10, gamma='scale',
-              probability=True, random_state=42)
-    svm.fit(X_tr, y_tr)
-    svm_acc = svm.score(X_val, y_val)
-    print(f"  SVM val accuracy : {svm_acc*100:.1f}%")
-
-    print("\n  Training Random Forest...")
-    rf = RandomForestClassifier(n_estimators=200, max_depth=20,
-                                n_jobs=-1, random_state=42)
-    rf.fit(X_tr, y_tr)
-    rf_acc = rf.score(X_val, y_val)
-    print(f"  RF  val accuracy : {rf_acc*100:.1f}%")
-
+def train_classical(X_fit, y_fit):
+    svm = SVC(kernel='rbf', C=10, gamma='scale', probability=True, random_state=SEED)
+    svm.fit(X_fit, y_fit)
+    rf = RandomForestClassifier(n_estimators=200, max_depth=20, n_jobs=-1, random_state=SEED)
+    rf.fit(X_fit, y_fit)
     return svm, rf
 
 
-def ensemble_predict(cnn, svm, rf, X_scaled, X_cnn, le):
-    """Soft vote: CNN 60% + SVM 25% + RF 15%"""
-    cnn_probs = cnn.predict(X_cnn, verbose=0)
-    svm_probs = svm.predict_proba(X_scaled)
-    rf_probs  = rf.predict_proba(X_scaled)
+def ensemble_predict(cnn, svm, rf, X_flat, n_classes):
+    cnn_p = cnn.predict(X_flat[..., None], verbose=0)
 
-    # ── FIX: convert all class labels to str for consistent lookup ──
-    classes     = [str(c) for c in le.classes_]
-    svm_classes = [str(c) for c in svm.classes_]
-    rf_classes  = [str(c) for c in rf.classes_]
-
-    def align(probs, src_classes):
-        out = np.zeros((probs.shape[0], len(classes)))
-        for i, c in enumerate(src_classes):
-            c = str(c)
-            if c in classes:
-                out[:, classes.index(c)] = probs[:, i]
+    def aligned(model):
+        p = model.predict_proba(X_flat)
+        out = np.zeros((len(X_flat), n_classes))
+        for i, c in enumerate(model.classes_):
+            out[:, int(c)] = p[:, i]
         return out
 
-    svm_probs = align(svm_probs, svm_classes)
-    rf_probs  = align(rf_probs,  rf_classes)
-
-    combined = 0.60 * cnn_probs + 0.25 * svm_probs + 0.15 * rf_probs
-    return np.argmax(combined, axis=1)
+    combined = 0.60 * cnn_p + 0.25 * aligned(svm) + 0.15 * aligned(rf)
+    return np.argmax(combined, axis=1), np.argmax(cnn_p, axis=1)
 
 
 # ══════════════════════════════════════════════════════════
-# PLOTS
+# STEP 4: TRAIN AND EVALUATE ONE SPLIT
 # ══════════════════════════════════════════════════════════
-def save_plots(history, y_val, y_pred, classes):
+def train_and_evaluate(X, y_enc, fit_idx, val_idx, test_idx, n_classes, tag):
+    set_seeds()
+    scaler = StandardScaler().fit(X[fit_idx])
+    Xf, Xv, Xt = (scaler.transform(X[i]) for i in (fit_idx, val_idx, test_idx))
+    yf, yv, yt = y_enc[fit_idx], y_enc[val_idx], y_enc[test_idx]
+
+    cnn = build_cnn_lstm(Xf.shape[1], n_classes)
+    callbacks = [
+        EarlyStopping(monitor='val_accuracy', patience=15, restore_best_weights=True, verbose=0),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=7, min_lr=1e-6, verbose=0),
+    ]
+    history = cnn.fit(
+        Xf[..., None], to_categorical(yf, n_classes),
+        validation_data=(Xv[..., None], to_categorical(yv, n_classes)),
+        epochs=EPOCHS, batch_size=BATCH_SIZE, callbacks=callbacks, verbose=VERBOSE
+    )
+
+    svm, rf = train_classical(Xf, yf)
+    ens_pred, cnn_pred = ensemble_predict(cnn, svm, rf, Xt, n_classes)
+
+    metrics = dict(
+        protocol=tag,
+        n_train=int(len(fit_idx)), n_val=int(len(val_idx)), n_test=int(len(test_idx)),
+        cnn_accuracy=float(accuracy_score(yt, cnn_pred)),
+        cnn_macro_f1=float(f1_score(yt, cnn_pred, average='macro')),
+        ensemble_accuracy=float(accuracy_score(yt, ens_pred)),
+        ensemble_macro_f1=float(f1_score(yt, ens_pred, average='macro')),
+    )
+    artifacts = dict(cnn=cnn, svm=svm, rf=rf, scaler=scaler, history=history)
+    return metrics, artifacts, yt, ens_pred
+
+
+# ══════════════════════════════════════════════════════════
+# STEP 5: PROTOCOLS
+# ══════════════════════════════════════════════════════════
+def speaker_independent_cv(X, y_enc, groups, is_aug, n_classes):
+    real_idx = np.where(~is_aug)[0]
+    sgkf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    all_speakers = sorted(set(groups))
+
+    fold_metrics, y_true_all, y_pred_all, first_artifacts = [], [], [], None
+    for k, (_, te_r) in enumerate(sgkf.split(X[real_idx], y_enc[real_idx], groups[real_idx])):
+        test_spk = set(groups[real_idx][te_r])
+        train_spk = [s for s in all_speakers if s not in test_spk]
+
+        rng = np.random.RandomState(SEED + k)
+        n_val = max(1, int(round(len(train_spk) * VAL_SPEAKER_FRACTION)))
+        val_spk = set(rng.choice(train_spk, n_val, replace=False))
+        fit_spk = set(train_spk) - val_spk
+
+        test_idx = np.where(np.isin(groups, list(test_spk)) & ~is_aug)[0]
+        val_idx  = np.where(np.isin(groups, list(val_spk)) & ~is_aug)[0]
+        fit_idx  = np.where(np.isin(groups, list(fit_spk)))[0]  # includes augmented copies
+
+        # Hard check: no speaker overlap between any two sets
+        assert not (set(groups[fit_idx]) & test_spk)
+        assert not (set(groups[val_idx]) & test_spk)
+        assert not (set(groups[fit_idx]) & val_spk)
+
+        print(f"\n  Fold {k + 1}/{N_FOLDS}: {len(fit_spk)} train, {len(val_spk)} val, "
+              f"{len(test_spk)} test speakers")
+        m, art, yt, yp = train_and_evaluate(X, y_enc, fit_idx, val_idx, test_idx,
+                                            n_classes, f"speaker_independent_fold_{k + 1}")
+        m['test_speakers'] = sorted(test_spk)
+        print(f"    CNN       acc {m['cnn_accuracy']*100:.2f}%  macro F1 {m['cnn_macro_f1']*100:.2f}%")
+        print(f"    Ensemble  acc {m['ensemble_accuracy']*100:.2f}%  macro F1 {m['ensemble_macro_f1']*100:.2f}%")
+
+        fold_metrics.append(m)
+        y_true_all.append(yt)
+        y_pred_all.append(yp)
+        if first_artifacts is None:
+            first_artifacts = art
+        if not RUN_ALL_FOLDS:
+            break
+
+    return fold_metrics, np.concatenate(y_true_all), np.concatenate(y_pred_all), first_artifacts
+
+
+def random_split_baseline(X, y_enc, n_classes):
+    """The old protocol: random split over all samples, augmented copies of the
+    same recording can land on both sides, and the test set is also used for
+    early stopping. Kept only to measure how much it inflates results."""
+    idx = np.arange(len(X))
+    tr, te = train_test_split(idx, test_size=0.15, random_state=SEED, stratify=y_enc)
+    m, _, _, _ = train_and_evaluate(X, y_enc, tr, te, te, n_classes, "random_split_old_protocol")
+    return m
+
+
+def summarise(fold_metrics, key):
+    vals = np.array([m[key] for m in fold_metrics])
+    return dict(mean=float(vals.mean()), std=float(vals.std()))
+
+
+def save_plots(history, y_true, y_pred, classes):
     fig, (a1, a2) = plt.subplots(1, 2, figsize=(14, 5))
-    a1.plot(history.history['accuracy'],     label='Train', lw=2, color='#3b82f6')
-    a1.plot(history.history['val_accuracy'], label='Val',   lw=2, color='#10b981')
-    a1.set_title('Accuracy', fontweight='bold'); a1.legend(); a1.grid(alpha=.3)
-    a1.set_xlabel('Epoch'); a1.set_ylabel('Accuracy')
-
-    a2.plot(history.history['loss'],     label='Train', lw=2, color='#3b82f6')
-    a2.plot(history.history['val_loss'], label='Val',   lw=2, color='#10b981')
-    a2.set_title('Loss', fontweight='bold'); a2.legend(); a2.grid(alpha=.3)
-    a2.set_xlabel('Epoch'); a2.set_ylabel('Loss')
-
+    for ax, key, title in [(a1, 'accuracy', 'Accuracy'), (a2, 'loss', 'Loss')]:
+        ax.plot(history.history[key], label='Train', lw=2, color='#3b82f6')
+        ax.plot(history.history[f'val_{key}'], label='Val (held out speakers)', lw=2, color='#10b981')
+        ax.set_title(f'{title} (fold 1)', fontweight='bold'); ax.legend(); ax.grid(alpha=.3)
+        ax.set_xlabel('Epoch')
     plt.tight_layout()
     plt.savefig(f'{MODEL_DIR}/training_history.png', dpi=150)
     plt.close()
 
-    cm  = confusion_matrix(y_val, y_pred)
-    pct = cm.astype(float) / cm.sum(axis=1, keepdims=True) * 100
+    cm = confusion_matrix(y_true, y_pred, labels=range(len(classes)))
+    pct = cm.astype(float) / np.maximum(cm.sum(axis=1, keepdims=True), 1) * 100
     plt.figure(figsize=(10, 8))
-    sns.heatmap(pct, annot=True, fmt='.1f', cmap='Blues',
-                xticklabels=classes, yticklabels=classes)
-    plt.title('Confusion Matrix (%)', fontweight='bold')
+    sns.heatmap(pct, annot=True, fmt='.1f', cmap='Blues', xticklabels=classes, yticklabels=classes)
+    plt.title('Confusion Matrix (%), speaker independent, all test folds', fontweight='bold')
     plt.xlabel('Predicted'); plt.ylabel('Actual')
     plt.tight_layout()
     plt.savefig(f'{MODEL_DIR}/confusion_matrix.png', dpi=150)
     plt.close()
-    print(f"  Plots saved to {MODEL_DIR}/")
 
 
 # ══════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════
 def main():
-    # ── Load (cached after first run) ──
+    set_seeds()
+    print("=" * 60)
+    print("  NEURASENSE TRAINING (speaker independent evaluation)")
+    print("=" * 60)
+
     print("\nSTEP 1: Loading datasets")
-    Xr, yr = load_ravdess(RAVDESS_PATH)
-    Xt, yt = load_tess(TESS_PATH)
+    records = load_ravdess(RAVDESS_PATH) + load_tess(TESS_PATH)
+    if not records:
+        print("\nERROR: No data. Run: python download_dataset.py")
+        return
 
-    if not Xr and not Xt:
-        print("\nERROR: No data. Run: python download_dataset.py"); return
+    X = np.array([r['x'] for r in records], dtype=np.float32)
+    y_raw = np.array([r['y'] for r in records])
+    groups = np.array([r['speaker'] for r in records])
+    is_aug = np.array([r['aug'] for r in records], dtype=bool)
 
-    X_raw = np.array(Xr + Xt, dtype=np.float32)
-    y_raw = np.array(yr + yt)
-
-    print(f"\n  Total: {len(X_raw)} samples | Feature dim: {X_raw.shape[1]}")
-    for em, cnt in zip(*np.unique(y_raw, return_counts=True)):
-        print(f"    {em:<12}: {cnt}")
-
-    # ── Encode + scale ──
-    print("\nSTEP 2: Preprocessing")
     le = LabelEncoder()
     y_enc = le.fit_transform(y_raw)
-    num_classes = len(le.classes_)
-    print(f"  Classes ({num_classes}): {list(le.classes_)}")
+    n_classes = len(le.classes_)
+    print(f"\n  {len(X)} samples ({(~is_aug).sum()} original, {is_aug.sum()} augmented)")
+    print(f"  {len(set(groups))} speakers | {n_classes} classes: {list(le.classes_)}")
 
-    scaler   = StandardScaler()
-    X_scaled = scaler.fit_transform(X_raw)
+    print("\nSTEP 2: Speaker independent cross validation")
+    folds, y_true, y_pred, art = speaker_independent_cv(X, y_enc, groups, is_aug, n_classes)
 
-    X_tr, X_val, y_tr, y_val = train_test_split(
-        X_scaled, y_enc, test_size=0.15, random_state=42, stratify=y_enc
-    )
-    print(f"  Train: {len(X_tr)} | Val: {len(X_val)}")
-
-    X_tr_cnn  = X_tr.reshape( len(X_tr),  X_tr.shape[1],  1)
-    X_val_cnn = X_val.reshape(len(X_val), X_val.shape[1], 1)
-    y_tr_cat  = to_categorical(y_tr,  num_classes)
-    y_val_cat = to_categorical(y_val, num_classes)
-
-    # ── Build CNN + LSTM ──
-    print("\nSTEP 3: Building CNN + LSTM model")
-    cnn = build_cnn_lstm(X_tr.shape[1], num_classes)
-    cnn.summary()
-
-    callbacks = [
-        EarlyStopping(
-            monitor='val_accuracy', patience=15,
-            restore_best_weights=True, verbose=1
-        ),
-        ReduceLROnPlateau(
-            monitor='val_loss', factor=0.5,
-            patience=7, min_lr=1e-6, verbose=1
-        ),
-        ModelCheckpoint(
-            f'{MODEL_DIR}/emotion_model.h5',
-            monitor='val_accuracy', save_best_only=True, verbose=1
+    results = dict(
+        speaker_independent=dict(
+            n_folds_run=len(folds),
+            cnn_accuracy=summarise(folds, 'cnn_accuracy'),
+            cnn_macro_f1=summarise(folds, 'cnn_macro_f1'),
+            ensemble_accuracy=summarise(folds, 'ensemble_accuracy'),
+            ensemble_macro_f1=summarise(folds, 'ensemble_macro_f1'),
+            folds=folds,
+            classification_report=classification_report(
+                y_true, y_pred, target_names=le.classes_, output_dict=True),
         )
-    ]
-
-    # ── Train ──
-    print(f"\nSTEP 4: Training  (batch={BATCH_SIZE}, max_epochs={EPOCHS})")
-    print("  (dataset loading is now instant from cache)\n")
-
-    history = cnn.fit(
-        X_tr_cnn, y_tr_cat,
-        validation_data=(X_val_cnn, y_val_cat),
-        epochs=EPOCHS,
-        batch_size=BATCH_SIZE,
-        callbacks=callbacks,
-        verbose=1
     )
 
-    _, cnn_acc = cnn.evaluate(X_val_cnn, y_val_cat, verbose=0)
-    print(f"\n  CNN val accuracy: {cnn_acc*100:.2f}%")
+    print("\n  Per class report (ensemble, all test folds pooled):")
+    print(classification_report(y_true, y_pred, target_names=le.classes_, digits=3))
 
-    # ── Ensemble ──
-    print("\nSTEP 5: Training ensemble")
-    svm, rf = train_ensemble(X_tr, y_tr, X_val, y_val, le)
+    if COMPARE_RANDOM_SPLIT:
+        print("\nSTEP 3: Old random split protocol (for comparison only)")
+        results['random_split_old_protocol'] = random_split_baseline(X, y_enc, n_classes)
 
-    y_pred   = ensemble_predict(cnn, svm, rf, X_val, X_val_cnn, le)
-    ens_acc  = (y_pred == y_val).mean()
-
-    print(f"\n  CNN-only  accuracy : {cnn_acc*100:.2f}%")
-    print(f"  ENSEMBLE  accuracy : {ens_acc*100:.2f}%")
-    print("\n  Per-class report (Ensemble):")
-    print(classification_report(y_val, y_pred, target_names=le.classes_))
-
-    # ── Save ──
-    print("\nSTEP 6: Saving artifacts")
-    cnn.save(f'{MODEL_DIR}/emotion_model.h5')
-
+    print("\nSTEP 4: Saving artifacts (model from fold 1)")
+    art['cnn'].save(f'{MODEL_DIR}/emotion_model.h5')
     for fname, obj in [
-        ('scaler.pkl',        scaler),
-        ('label_encoder.pkl', le),
-        ('svm_model.pkl',     svm),
-        ('rf_model.pkl',      rf),
-        ('feature_dim.pkl',   int(X_scaled.shape[1])),
+        ('scaler.pkl', art['scaler']), ('label_encoder.pkl', le),
+        ('svm_model.pkl', art['svm']), ('rf_model.pkl', art['rf']),
+        ('feature_dim.pkl', int(X.shape[1])),
     ]:
         with open(f'{MODEL_DIR}/{fname}', 'wb') as f:
             pickle.dump(obj, f)
+    with open(f'{MODEL_DIR}/results.json', 'w') as f:
+        json.dump(results, f, indent=2)
+    save_plots(art['history'], y_true, y_pred, le.classes_)
 
-    print("  ✅ All artifacts saved to ./models/")
-
-    # ── Plots ──
-    print("\nSTEP 7: Saving plots")
-    save_plots(history, y_val, y_pred, le.classes_)
-
+    si = results['speaker_independent']
     print("\n" + "=" * 60)
-    print(f"  ✅  TRAINING COMPLETE")
-    print(f"  CNN   accuracy : {cnn_acc*100:.2f}%")
-    print(f"  Ensemble acc   : {ens_acc*100:.2f}%")
+    print("  RESULTS")
     print("=" * 60)
-    print("\n  Next step: python app.py\n")
+    print(f"  Speaker independent ({si['n_folds_run']} fold(s)), mean +/- std:")
+    for k in ['cnn_accuracy', 'cnn_macro_f1', 'ensemble_accuracy', 'ensemble_macro_f1']:
+        print(f"    {k:<20} {si[k]['mean']*100:6.2f}% +/- {si[k]['std']*100:.2f}")
+    if COMPARE_RANDOM_SPLIT:
+        rs = results['random_split_old_protocol']
+        print("  Old random split protocol:")
+        print(f"    ensemble_accuracy    {rs['ensemble_accuracy']*100:6.2f}%")
+        print(f"    ensemble_macro_f1    {rs['ensemble_macro_f1']*100:6.2f}%")
+    print("\n  Full results saved to models/results.json")
 
 
 if __name__ == '__main__':
